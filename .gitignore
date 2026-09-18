@@ -1,0 +1,6 @@
+node_modules
+api/node_modules
+.env
+.env.local
+*.log
+n8n_data
