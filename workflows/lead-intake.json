@@ -1,0 +1,761 @@
+{
+  "name": "lead-intake",
+  "id": "wf_lead_intake",
+  "active": false,
+  "isArchived": false,
+  "nodes": [
+    {
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        300
+      ],
+      "id": "webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "webhookId": "lead-intake",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-intake",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "CRED_HEADER_AUTH",
+          "name": "Lead Intake Header Auth"
+        }
+      }
+    },
+    {
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "id": "normalize-lead",
+      "name": "Normalize lead",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "jsCode": "/**\n * Normaliza el payload del webhook. Pegar en Code node \"Normalize lead\".\n */\nfunction firstName(full) {\n  return String(full || \"\")\n    .trim()\n    .split(/\\s+/)[0] || \"Hola\";\n}\n\nfunction nowIso() {\n  return new Date().toISOString();\n}\n\nfunction leadId() {\n  if (typeof crypto !== \"undefined\" && crypto.randomUUID) return crypto.randomUUID();\n  return \"ld_\" + Date.now() + \"_\" + Math.random().toString(16).slice(2);\n}\n\nif (typeof $input !== \"undefined\") {\n  return $input.all().map(function (item) {\n    const src = item.json.body && typeof item.json.body === \"object\" ? item.json.body : item.json;\n    const email = String(src.emailNormalized || src.email || \"\")\n      .trim()\n      .toLowerCase();\n    const json = Object.assign({}, src, {\n      emailNormalized: email,\n      fullName: String(src.fullName || \"\").trim(),\n      firstName: firstName(src.fullName),\n      company: String(src.company || \"\").trim(),\n      message: String(src.message || \"\").trim().slice(0, 500),\n      leadId: src.leadId || leadId(),\n      createdAt: src.createdAt || nowIso(),\n      updatedAt: nowIso(),\n      timeZone: \"America/Mexico_City\",\n      source: \"web_form\",\n      submissionsCount: 1,\n      history: [{ ts: nowIso(), event: \"received\" }],\n      flags: Object.assign(\n        {\n          confirmationSent: false,\n          slackSent: false,\n          briefCreated: false,\n          calendarEventCreated: false,\n          emailValidated: false,\n          aiDone: false,\n          spam: false,\n        },\n        src.flags || {},\n      ),\n    });\n    return { json: json };\n  });\n}\n\nif (typeof module !== \"undefined\") {\n  module.exports = { firstName: firstName };\n}\n"
+      }
+    },
+    {
+      "typeVersion": 1.2,
+      "position": [
+        440,
+        300
+      ],
+      "id": "find-existing",
+      "name": "Find existing",
+      "type": "n8n-nodes-base.mongoDb",
+      "parameters": {
+        "operation": "find",
+        "collection": "leads",
+        "options": {
+          "limit": 1
+        },
+        "query": "={ \"$or\": [ { \"emailNormalized\": \"{{ $json.emailNormalized }}\" }, { \"submissionId\": \"{{ $json.submissionId }}\" } ] }"
+      },
+      "credentials": {
+        "mongoDb": {
+          "id": "CRED_MONGO",
+          "name": "MongoDB leadflow"
+        }
+      }
+    },
+    {
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        300
+      ],
+      "id": "has-duplicate-",
+      "name": "Has duplicate?",
+      "type": "n8n-nodes-base.if",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "dup",
+              "leftValue": "={{ $json._id || $json.leadId }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "typeVersion": 2,
+      "position": [
+        880,
+        120
+      ],
+      "id": "mark-duplicate",
+      "name": "Mark duplicate",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "jsCode": "\nconst item = $input.first().json;\nconst existing = item.existing || item;\nitem.duplicate = true;\nitem.leadId = existing.leadId || item.leadId;\nitem.tier = existing.tier || item.tier;\nitem.score = existing.score || item.score;\nitem.bookingUrl = existing.bookingUrl || item.bookingUrl;\nitem.submissionsCount = (existing.submissionsCount || 1) + 1;\nitem.status = existing.status || \"active\";\nitem.flags = Object.assign({}, existing.flags || {}, item.flags || {});\nitem.history = (existing.history || []).concat([{ ts: new Date().toISOString(), event: \"resubmit\", submissionId: item.submissionId }]);\nreturn [{ json: item }];\n"
+      }
+    },
+    {
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        480
+      ],
+      "id": "validate-email",
+      "name": "Validate email",
+      "type": "n8n-nodes-base.httpRequest",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetween": 2000,
+      "parameters": {
+        "method": "GET",
+        "url": "=https://emailvalidation.abstractapi.com/v1/?api_key={{ $env.ABSTRACT_API_KEY }}&email={{ $json.emailNormalized }}",
+        "options": {
+          "timeout": 8000
+        }
+      }
+    },
+    {
+      "typeVersion": 2,
+      "position": [
+        1100,
+        480
+      ],
+      "id": "merge-email-check",
+      "name": "Merge email check",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "jsCode": "\nconst item = $input.first().json;\nlet check = item.emailCheck || item;\nif (item.body) check = item.body;\nitem.enrichment = Object.assign({}, item.enrichment || {}, { emailCheck: check });\nitem.flags = Object.assign({}, item.flags || {}, { emailValidated: true });\nif (check && (check.disposable === true || (check.is_disposable_email && check.is_disposable_email.value === true))) {\n  item.enrichment.emailCheck = check;\n}\nreturn [{ json: item }];\n"
+      }
+    },
+    {
+      "typeVersion": 2,
+      "position": [
+        1320,
+        480
+      ],
+      "id": "score-lead",
+      "name": "Score lead",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "jsCode": "/**\n * Lead scoring — pegar tal cual en el Code node de n8n\n * (modo: Run Once for All Items).\n * Los tests lo importan con require().\n *\n * Total = clamp(suma - penalizaciones, 0, 100)\n * Tier: A ≥ 70 · B 40–69 · C < 40\n * spamRisk ≥ 0.7 → fuerza C, flags.spam = true (no altera el número salvo la UI de ruteo)\n */\n\nconst FREE_EMAIL_DOMAINS = [\n  \"gmail.com\",\n  \"googlemail.com\",\n  \"hotmail.com\",\n  \"hotmail.es\",\n  \"outlook.com\",\n  \"outlook.es\",\n  \"yahoo.com\",\n  \"yahoo.com.mx\",\n  \"yahoo.es\",\n  \"icloud.com\",\n  \"me.com\",\n  \"mac.com\",\n  \"proton.me\",\n  \"protonmail.com\",\n  \"live.com\",\n  \"msn.com\",\n  \"aol.com\",\n  \"yopmail.com\",\n  \"gmx.com\",\n  \"gmx.es\",\n  \"mail.com\",\n  \"zoho.com\",\n];\n\nconst DISPOSABLE_DOMAINS = [\n  \"mailinator.com\",\n  \"guerrillamail.com\",\n  \"10minutemail.com\",\n  \"tempmail.com\",\n  \"throwaway.email\",\n  \"trashmail.com\",\n  \"getnada.com\",\n  \"temp-mail.org\",\n  \"fakeinbox.com\",\n  \"maildrop.cc\",\n  \"sharklasers.com\",\n  \"guerrillamailblock.com\",\n  \"yopmail.com\",\n  \"dispostable.com\",\n  \"mailnesia.com\",\n  \"guerrillamail.org\",\n  \"grr.la\",\n  \"discard.email\",\n];\n\nconst IDEAL_NICHES = [\n  \"ecommerce\",\n  \"professional_services\",\n  \"health_wellness\",\n  \"saas_tech\",\n];\n\nconst LISTED_NICHES = [\n  \"ecommerce\",\n  \"professional_services\",\n  \"health_wellness\",\n  \"saas_tech\",\n  \"real_estate\",\n  \"education\",\n  \"restaurants_hospitality\",\n];\n\nconst CORE_NEEDS = [\"automation\", \"marketing_leads\", \"integrations_crm\"];\nconst SITE_BRAND_NEEDS = [\"website_landing\", \"branding_design\"];\n\nconst BUDGET_POINTS = {\n  lt10k: 0,\n  \"10k_30k\": 12,\n  \"30k_80k\": 25,\n  gt80k: 35,\n};\n\nconst URGENCY_POINTS = {\n  exploring: 0,\n  q1: 8,\n  month: 17,\n  asap: 25,\n};\n\nfunction clamp(n, min, max) {\n  return Math.max(min, Math.min(max, n));\n}\n\nfunction domainFromEmail(email) {\n  const normalized = String(email || \"\")\n    .trim()\n    .toLowerCase();\n  const at = normalized.lastIndexOf(\"@\");\n  return at >= 0 ? normalized.slice(at + 1) : \"\";\n}\n\nfunction isCorporateEmail(email) {\n  const domain = domainFromEmail(email);\n  return domain.length > 0 && FREE_EMAIL_DOMAINS.indexOf(domain) === -1;\n}\n\nfunction isDisposableEmail(email, enrichment) {\n  if (enrichment && enrichment.disposable === true) return true;\n  if (enrichment && enrichment.is_disposable_email) {\n    const flag = enrichment.is_disposable_email;\n    if (flag === true || (flag && flag.value === true)) return true;\n  }\n  const domain = domainFromEmail(email);\n  return DISPOSABLE_DOMAINS.indexOf(domain) !== -1;\n}\n\nfunction heuristicSpamRisk(lead) {\n  const msg = String(lead.message || \"\").toLowerCase();\n  if (\n    /viagra|casino online|crypto airdrop|seo backlinks|nudes/.test(msg)\n  ) {\n    return 0.85;\n  }\n  return 0;\n}\n\nfunction calculateScore(lead) {\n  const email = lead.emailNormalized || lead.email || \"\";\n  const enrichment =\n    (lead.enrichment && lead.enrichment.emailCheck) || lead.emailCheck || null;\n\n  const breakdown = {\n    budget: BUDGET_POINTS[lead.budget] != null ? BUDGET_POINTS[lead.budget] : 0,\n    urgency:\n      URGENCY_POINTS[lead.urgency] != null ? URGENCY_POINTS[lead.urgency] : 0,\n    niche: IDEAL_NICHES.indexOf(lead.niche) !== -1\n      ? 15\n      : LISTED_NICHES.indexOf(lead.niche) !== -1\n        ? 8\n        : 0,\n    need:\n      CORE_NEEDS.indexOf(lead.need) !== -1\n        ? 10\n        : SITE_BRAND_NEEDS.indexOf(lead.need) !== -1\n          ? 6\n          : 0,\n    corporateEmail: isCorporateEmail(email) ? 10 : 0,\n    validPhone: lead.phoneValid === true || Boolean(lead.phoneE164) ? 5 : 0,\n    disposablePenalty: 0,\n  };\n\n  const disposable = isDisposableEmail(email, enrichment);\n  if (disposable) breakdown.disposablePenalty = 25;\n\n  const raw =\n    breakdown.budget +\n    breakdown.urgency +\n    breakdown.niche +\n    breakdown.need +\n    breakdown.corporateEmail +\n    breakdown.validPhone -\n    breakdown.disposablePenalty;\n\n  const score = clamp(raw, 0, 100);\n\n  const flags = {\n    spam: false,\n    disposableEmail: disposable,\n    corporateEmail: breakdown.corporateEmail === 10,\n  };\n\n  const spamRisk =\n    typeof lead.spamRisk === \"number\"\n      ? lead.spamRisk\n      : lead.flags && typeof lead.flags.spamRisk === \"number\"\n        ? lead.flags.spamRisk\n        : heuristicSpamRisk(lead);\n\n  if (spamRisk >= 0.7) {\n    flags.spam = true;\n  }\n\n  let tier = \"C\";\n  if (!flags.spam && score >= 70) tier = \"A\";\n  else if (!flags.spam && score >= 40) tier = \"B\";\n  else tier = \"C\";\n\n  return { score: score, tier: tier, breakdown: breakdown, flags: flags, spamRisk: spamRisk };\n}\n\nfunction bookingUrlForTier(tier, calBase) {\n  const base = (calBase || \"https://cal.com/orbita\").replace(/\\/$/, \"\");\n  if (tier === \"A\") return base + \"/priority-15min\";\n  if (tier === \"B\") return base + \"/discovery-30min\";\n  return null;\n}\n\nfunction applyScoringToItem(json) {\n  const payload =\n    json && json.body && typeof json.body === \"object\"\n      ? Object.assign({}, json, json.body)\n      : json || {};\n  const result = calculateScore(payload);\n  const calBase = payload.calBaseUrl || payload.CAL_BASE_URL;\n  const bookingUrl = result.flags.spam\n    ? null\n    : bookingUrlForTier(result.tier, calBase);\n  return Object.assign({}, payload, {\n    scoring: result,\n    score: result.score,\n    tier: result.tier,\n    flags: Object.assign({}, payload.flags || {}, result.flags),\n    bookingUrl: bookingUrl,\n  });\n}\n\nif (typeof $input !== \"undefined\") {\n  return $input.all().map(function (item) {\n    return { json: applyScoringToItem(item.json) };\n  });\n}\n\nif (typeof module !== \"undefined\" && module.exports) {\n  module.exports = {\n    calculateScore: calculateScore,\n    applyScoringToItem: applyScoringToItem,\n    isCorporateEmail: isCorporateEmail,\n    isDisposableEmail: isDisposableEmail,\n    bookingUrlForTier: bookingUrlForTier,\n    FREE_EMAIL_DOMAINS: FREE_EMAIL_DOMAINS,\n    DISPOSABLE_DOMAINS: DISPOSABLE_DOMAINS,\n  };\n}\n"
+      }
+    },
+    {
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        480
+      ],
+      "id": "ask-llm",
+      "name": "Ask LLM",
+      "type": "n8n-nodes-base.httpRequest",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetween": 2000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.LLM_API_URL || 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "x-goog-api-key",
+              "value": "={{ $env.LLM_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ contents: [{ parts: [{ text: \"Eres un analista de una agencia mexicana llamada ÓRBITA (demo). Recibes datos de un prospecto SIN correo completo ni teléfono. Devuelve SOLO JSON válido, sin markdown, con esta forma:\\n\\n{\\n  \\\"summary\\\": \\\"resumen en es-MX, 2 oraciones máx.\\\",\\n  \\\"intent\\\": \\\"comprar_ahora\\\" | \\\"evaluando\\\" | \\\"curioseando\\\",\\n  \\\"spamRisk\\\": 0.0,\\n  \\\"intro\\\": \\\"una frase cálida para el correo de confirmación, sin mencionar puntaje ni letra de órbita\\\"\\n}\\n\\nReglas:\\n- spamRisk entre 0 y 1. Usa 0.7+ solo con señales claras (links de apuestas, crypto unsolicited, texto sin sentido, pitch de SEO spam).\\n- No inventes empresa ni presupuesto.\\n- No pidas más datos.\\n- intro en segunda persona, tono serio-poético, máximo 160 caracteres.\\n\\nDatos:\\nNombre de pila: {{firstName}}\\nEmpresa: {{company}}\\nNicho: {{niche}}\\nNecesidad: {{need}}\\nPresupuesto (banda): {{budget}}\\nUrgencia: {{urgency}}\\nMensaje (recortado): {{message}}\\nDominio de correo: {{emailDomain}}\\n\" .replace('{{firstName}}',$json.firstName||'').replace('{{company}}',$json.company||'').replace('{{niche}}',$json.niche||'').replace('{{need}}',$json.need||'').replace('{{budget}}',$json.budget||'').replace('{{urgency}}',$json.urgency||'').replace('{{message}}',String($json.message||'').slice(0,280)).replace('{{emailDomain}}', String($json.emailNormalized||'').split('@')[1] || '') }] }], generationConfig: { temperature: 0.2 } }) }}",
+        "options": {
+          "timeout": 12000
+        }
+      }
+    },
+    {
+      "typeVersion": 2,
+      "position": [
+        1760,
+        480
+      ],
+      "id": "parse-ai",
+      "name": "Parse AI",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "jsCode": "\nconst item = $input.first().json;\nlet ai = { summary: (item.company || \"Prospecto\") + \" busca apoyo en \" + (item.need || \"su proyecto\") + \".\", intent: \"evaluando\", spamRisk: 0, intro: \"Recibimos tu señal. Ya estamos trazando la aproximación.\" };\ntry {\n  const raw = $input.first().json;\n  let text = \"\";\n  if (typeof raw === \"string\") text = raw;\n  else if (raw && raw.candidates && raw.candidates[0] && raw.candidates[0].content) {\n    text = raw.candidates[0].content.parts.map(function(p){return p.text}).join(\"\\n\");\n  }\n  const start = text.indexOf(\"{\");\n  const end = text.lastIndexOf(\"}\");\n  if (start >= 0 && end > start) ai = Object.assign(ai, JSON.parse(text.slice(start, end + 1)));\n} catch (e) {}\nitem.ai = ai;\nitem.aiIntro = ai.intro;\nitem.spamRisk = typeof ai.spamRisk === \"number\" ? ai.spamRisk : 0;\nif (item.spamRisk >= 0.7) {\n  item.flags = Object.assign({}, item.flags, { spam: true });\n  item.tier = \"C\";\n  item.bookingUrl = null;\n  item.status = \"spam\";\n}\nitem.flags = Object.assign({}, item.flags, { aiDone: true });\nreturn [{ json: item }];\n"
+      }
+    },
+    {
+      "typeVersion": 2,
+      "position": [
+        1980,
+        480
+      ],
+      "id": "score-after-ai-spam",
+      "name": "Score after AI spam",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "jsCode": "/**\n * Lead scoring — pegar tal cual en el Code node de n8n\n * (modo: Run Once for All Items).\n * Los tests lo importan con require().\n *\n * Total = clamp(suma - penalizaciones, 0, 100)\n * Tier: A ≥ 70 · B 40–69 · C < 40\n * spamRisk ≥ 0.7 → fuerza C, flags.spam = true (no altera el número salvo la UI de ruteo)\n */\n\nconst FREE_EMAIL_DOMAINS = [\n  \"gmail.com\",\n  \"googlemail.com\",\n  \"hotmail.com\",\n  \"hotmail.es\",\n  \"outlook.com\",\n  \"outlook.es\",\n  \"yahoo.com\",\n  \"yahoo.com.mx\",\n  \"yahoo.es\",\n  \"icloud.com\",\n  \"me.com\",\n  \"mac.com\",\n  \"proton.me\",\n  \"protonmail.com\",\n  \"live.com\",\n  \"msn.com\",\n  \"aol.com\",\n  \"yopmail.com\",\n  \"gmx.com\",\n  \"gmx.es\",\n  \"mail.com\",\n  \"zoho.com\",\n];\n\nconst DISPOSABLE_DOMAINS = [\n  \"mailinator.com\",\n  \"guerrillamail.com\",\n  \"10minutemail.com\",\n  \"tempmail.com\",\n  \"throwaway.email\",\n  \"trashmail.com\",\n  \"getnada.com\",\n  \"temp-mail.org\",\n  \"fakeinbox.com\",\n  \"maildrop.cc\",\n  \"sharklasers.com\",\n  \"guerrillamailblock.com\",\n  \"yopmail.com\",\n  \"dispostable.com\",\n  \"mailnesia.com\",\n  \"guerrillamail.org\",\n  \"grr.la\",\n  \"discard.email\",\n];\n\nconst IDEAL_NICHES = [\n  \"ecommerce\",\n  \"professional_services\",\n  \"health_wellness\",\n  \"saas_tech\",\n];\n\nconst LISTED_NICHES = [\n  \"ecommerce\",\n  \"professional_services\",\n  \"health_wellness\",\n  \"saas_tech\",\n  \"real_estate\",\n  \"education\",\n  \"restaurants_hospitality\",\n];\n\nconst CORE_NEEDS = [\"automation\", \"marketing_leads\", \"integrations_crm\"];\nconst SITE_BRAND_NEEDS = [\"website_landing\", \"branding_design\"];\n\nconst BUDGET_POINTS = {\n  lt10k: 0,\n  \"10k_30k\": 12,\n  \"30k_80k\": 25,\n  gt80k: 35,\n};\n\nconst URGENCY_POINTS = {\n  exploring: 0,\n  q1: 8,\n  month: 17,\n  asap: 25,\n};\n\nfunction clamp(n, min, max) {\n  return Math.max(min, Math.min(max, n));\n}\n\nfunction domainFromEmail(email) {\n  const normalized = String(email || \"\")\n    .trim()\n    .toLowerCase();\n  const at = normalized.lastIndexOf(\"@\");\n  return at >= 0 ? normalized.slice(at + 1) : \"\";\n}\n\nfunction isCorporateEmail(email) {\n  const domain = domainFromEmail(email);\n  return domain.length > 0 && FREE_EMAIL_DOMAINS.indexOf(domain) === -1;\n}\n\nfunction isDisposableEmail(email, enrichment) {\n  if (enrichment && enrichment.disposable === true) return true;\n  if (enrichment && enrichment.is_disposable_email) {\n    const flag = enrichment.is_disposable_email;\n    if (flag === true || (flag && flag.value === true)) return true;\n  }\n  const domain = domainFromEmail(email);\n  return DISPOSABLE_DOMAINS.indexOf(domain) !== -1;\n}\n\nfunction heuristicSpamRisk(lead) {\n  const msg = String(lead.message || \"\").toLowerCase();\n  if (\n    /viagra|casino online|crypto airdrop|seo backlinks|nudes/.test(msg)\n  ) {\n    return 0.85;\n  }\n  return 0;\n}\n\nfunction calculateScore(lead) {\n  const email = lead.emailNormalized || lead.email || \"\";\n  const enrichment =\n    (lead.enrichment && lead.enrichment.emailCheck) || lead.emailCheck || null;\n\n  const breakdown = {\n    budget: BUDGET_POINTS[lead.budget] != null ? BUDGET_POINTS[lead.budget] : 0,\n    urgency:\n      URGENCY_POINTS[lead.urgency] != null ? URGENCY_POINTS[lead.urgency] : 0,\n    niche: IDEAL_NICHES.indexOf(lead.niche) !== -1\n      ? 15\n      : LISTED_NICHES.indexOf(lead.niche) !== -1\n        ? 8\n        : 0,\n    need:\n      CORE_NEEDS.indexOf(lead.need) !== -1\n        ? 10\n        : SITE_BRAND_NEEDS.indexOf(lead.need) !== -1\n          ? 6\n          : 0,\n    corporateEmail: isCorporateEmail(email) ? 10 : 0,\n    validPhone: lead.phoneValid === true || Boolean(lead.phoneE164) ? 5 : 0,\n    disposablePenalty: 0,\n  };\n\n  const disposable = isDisposableEmail(email, enrichment);\n  if (disposable) breakdown.disposablePenalty = 25;\n\n  const raw =\n    breakdown.budget +\n    breakdown.urgency +\n    breakdown.niche +\n    breakdown.need +\n    breakdown.corporateEmail +\n    breakdown.validPhone -\n    breakdown.disposablePenalty;\n\n  const score = clamp(raw, 0, 100);\n\n  const flags = {\n    spam: false,\n    disposableEmail: disposable,\n    corporateEmail: breakdown.corporateEmail === 10,\n  };\n\n  const spamRisk =\n    typeof lead.spamRisk === \"number\"\n      ? lead.spamRisk\n      : lead.flags && typeof lead.flags.spamRisk === \"number\"\n        ? lead.flags.spamRisk\n        : heuristicSpamRisk(lead);\n\n  if (spamRisk >= 0.7) {\n    flags.spam = true;\n  }\n\n  let tier = \"C\";\n  if (!flags.spam && score >= 70) tier = \"A\";\n  else if (!flags.spam && score >= 40) tier = \"B\";\n  else tier = \"C\";\n\n  return { score: score, tier: tier, breakdown: breakdown, flags: flags, spamRisk: spamRisk };\n}\n\nfunction bookingUrlForTier(tier, calBase) {\n  const base = (calBase || \"https://cal.com/orbita\").replace(/\\/$/, \"\");\n  if (tier === \"A\") return base + \"/priority-15min\";\n  if (tier === \"B\") return base + \"/discovery-30min\";\n  return null;\n}\n\nfunction applyScoringToItem(json) {\n  const payload =\n    json && json.body && typeof json.body === \"object\"\n      ? Object.assign({}, json, json.body)\n      : json || {};\n  const result = calculateScore(payload);\n  const calBase = payload.calBaseUrl || payload.CAL_BASE_URL;\n  const bookingUrl = result.flags.spam\n    ? null\n    : bookingUrlForTier(result.tier, calBase);\n  return Object.assign({}, payload, {\n    scoring: result,\n    score: result.score,\n    tier: result.tier,\n    flags: Object.assign({}, payload.flags || {}, result.flags),\n    bookingUrl: bookingUrl,\n  });\n}\n\nif (typeof $input !== \"undefined\") {\n  return $input.all().map(function (item) {\n    return { json: applyScoringToItem(item.json) };\n  });\n}\n\nif (typeof module !== \"undefined\" && module.exports) {\n  module.exports = {\n    calculateScore: calculateScore,\n    applyScoringToItem: applyScoringToItem,\n    isCorporateEmail: isCorporateEmail,\n    isDisposableEmail: isDisposableEmail,\n    bookingUrlForTier: bookingUrlForTier,\n    FREE_EMAIL_DOMAINS: FREE_EMAIL_DOMAINS,\n    DISPOSABLE_DOMAINS: DISPOSABLE_DOMAINS,\n  };\n}\n"
+      }
+    },
+    {
+      "typeVersion": 1.2,
+      "position": [
+        2200,
+        480
+      ],
+      "id": "insert-lead",
+      "name": "Insert lead",
+      "type": "n8n-nodes-base.mongoDb",
+      "parameters": {
+        "operation": "insert",
+        "collection": "leads",
+        "fields": "leadId,submissionId,emailNormalized,fullName,phoneE164,company,niche,budget,urgency,need,message,consent,utm,score,tier,status,flags,bookingUrl,submissionsCount,history,enrichment,createdAt,updatedAt,timeZone,source,ai",
+        "options": {}
+      },
+      "credentials": {
+        "mongoDb": {
+          "id": "CRED_MONGO",
+          "name": "MongoDB leadflow"
+        }
+      }
+    },
+    {
+      "typeVersion": 2,
+      "position": [
+        2420,
+        300
+      ],
+      "id": "prepare-outputs",
+      "name": "Prepare outputs",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "jsCode": "\nconst item = $input.first().json;\nconst spam = Boolean(item.flags && item.flags.spam);\nconst duplicate = Boolean(item.duplicate);\nitem.status = spam ? \"spam\" : duplicate ? item.status || \"active\" : \"active\";\nitem.webhookResponse = {\n  leadId: item.leadId,\n  tier: item.tier,\n  bookingUrl: spam ? null : item.bookingUrl || null,\n  duplicate: duplicate,\n  status: item.status,\n};\nitem.skipConfirmation = spam || duplicate || Boolean(item.flags && item.flags.confirmationSent);\nitem.skipSlack = Boolean(item.flags && item.flags.slackSent);\nitem.needsBrief = !spam && (item.tier === \"A\" || item.tier === \"B\") && !Boolean(item.flags && item.flags.briefCreated);\nitem.needsCalendar = !spam && item.tier === \"A\" && !Boolean(item.flags && item.flags.calendarEventCreated);\nitem.slackPayload = {\n  text: (duplicate ? \"Reenvío\" : spam ? \"Lead spam\" : \"Nuevo lead\") + \" · \" + (item.fullName || \"\"),\n  blocks: [\n    { type: \"header\", text: { type: \"plain_text\", text: (spam ? \"Alerta silenciosa\" : duplicate ? \"Reenvío\" : item.tier === \"A\" ? \"ÓRBITA A — prioridad\" : \"Nuevo lead \" + item.tier) } },\n    { type: \"section\", fields: [\n      { type: \"mrkdwn\", text: \"*Nombre*\\n\" + (item.fullName || \"\") },\n      { type: \"mrkdwn\", text: \"*Empresa*\\n\" + (item.company || \"\") },\n      { type: \"mrkdwn\", text: \"*Score*\\n\" + String(item.score) },\n      { type: \"mrkdwn\", text: \"*Tier*\\n\" + item.tier },\n      { type: \"mrkdwn\", text: \"*Correo*\\n\" + (item.emailNormalized || \"\") },\n      { type: \"mrkdwn\", text: \"*Tel*\\n\" + (item.phoneE164 || \"\") }\n    ]},\n    { type: \"context\", elements: [{ type: \"mrkdwn\", text: \"nicho \" + (item.niche || \"\") + \" · \" + (item.need || \"\") + (item.bookingUrl ? \" · <\" + item.bookingUrl + \"|agenda>\" : \"\") }] }\n  ]\n};\nreturn [{ json: item }];\n"
+      }
+    },
+    {
+      "typeVersion": 1.1,
+      "position": [
+        2640,
+        300
+      ],
+      "id": "respond-to-webhook",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.webhookResponse) }}",
+        "options": {}
+      }
+    },
+    {
+      "typeVersion": 2,
+      "position": [
+        2860,
+        300
+      ],
+      "id": "email-templates",
+      "name": "Email templates",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "jsCode": "/**\n * Plantillas de correo HTML + texto plano. Pegar en Code node \"Email templates\"\n * o reutilizar las funciones.\n */\n\nfunction escapeHtml(s) {\n  return String(s || \"\")\n    .replace(/&/g, \"&amp;\")\n    .replace(/</g, \"&lt;\")\n    .replace(/>/g, \"&gt;\");\n}\n\nfunction confirmationHtml(lead) {\n  const name = escapeHtml(lead.firstName || \"Hola\");\n  const intro = escapeHtml(lead.aiIntro || \"Recibimos tu señal. El equipo ya está en trayectoria de acercamiento.\");\n  const cta = lead.bookingUrl\n    ? '<p style=\"margin:24px 0\"><a href=\"' +\n      escapeHtml(lead.bookingUrl) +\n      '\" style=\"background:#C8FF3D;color:#0A0908;padding:12px 20px;text-decoration:none;font-weight:700\">Elegir horario</a></p>'\n    : \"<p>Te escribiremos con el siguiente paso. No hace falta que agendes ahora.</p>\";\n  return (\n    '<!doctype html><html lang=\"es-MX\"><body style=\"margin:0;background:#0A0908;color:#F2EDE4;font-family:Georgia,serif\">' +\n    '<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#0A0908\"><tr><td align=\"center\" style=\"padding:32px 16px\">' +\n    '<table width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;border:1px solid #2A2723\">' +\n    '<tr><td style=\"padding:28px 28px 8px;font-family:Arial,sans-serif;letter-spacing:.28em;font-size:11px;color:#C8FF3D\">ÓRBITA · DEMO</td></tr>' +\n    '<tr><td style=\"padding:8px 28px 0;font-size:28px;line-height:1.1\">Tu proyecto ya tiene gravedad, ' +\n    name +\n    \".</td></tr>\" +\n    '<tr><td style=\"padding:16px 28px 8px;color:#8A8478;font-style:italic\">' +\n    intro +\n    \"</td></tr>\" +\n    '<tr><td style=\"padding:8px 28px 28px;color:#F2EDE4\">' +\n    cta +\n    '<p style=\"font-size:12px;color:#8A8478\">Si no fuiste tú, ignora este correo.</p></td></tr>' +\n    \"</table></td></tr></table></body></html>\"\n  );\n}\n\nfunction confirmationText(lead) {\n  const name = lead.firstName || \"Hola\";\n  const intro = lead.aiIntro || \"Recibimos tu señal. El equipo ya está en trayectoria de acercamiento.\";\n  const cta = lead.bookingUrl ? \"Agenda: \" + lead.bookingUrl : \"Te escribiremos con el siguiente paso.\";\n  return (\n    \"ÓRBITA (demo)\\n\\n\" +\n    name +\n    \", tu proyecto ya tiene gravedad.\\n\\n\" +\n    intro +\n    \"\\n\\n\" +\n    cta +\n    \"\\n\\nSi no fuiste tú, ignora este correo.\"\n  );\n}\n\nfunction internalSubject(lead) {\n  const tag = lead.flags && lead.flags.spam ? \"SPAM\" : lead.duplicate ? \"REENVÍO\" : lead.tier;\n  return \"[ÓRBITA \" + tag + \"] \" + (lead.fullName || \"\") + \" · \" + (lead.company || \"\");\n}\n\nif (typeof $input !== \"undefined\") {\n  return $input.all().map(function (item) {\n    const j = item.json;\n    j.emailHtml = confirmationHtml(j);\n    j.emailText = confirmationText(j);\n    j.emailSubject =\n      j.flags && j.flags.spam ? \"\" : \"Tu órbita ya está en curso, \" + (j.firstName || \"\");\n    j.internalSubject = internalSubject(j);\n    return { json: j };\n  });\n}\n\nif (typeof module !== \"undefined\") {\n  module.exports = {\n    confirmationHtml: confirmationHtml,\n    confirmationText: confirmationText,\n    internalSubject: internalSubject,\n  };\n}\n"
+      }
+    },
+    {
+      "typeVersion": 2.2,
+      "position": [
+        3080,
+        300
+      ],
+      "id": "skip-confirmation-",
+      "name": "Skip confirmation?",
+      "type": "n8n-nodes-base.if",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "skip",
+              "leftValue": "={{ $json.skipConfirmation }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "typeVersion": 2.1,
+      "position": [
+        3300,
+        480
+      ],
+      "id": "gmail-confirm",
+      "name": "Gmail confirm",
+      "type": "n8n-nodes-base.gmail",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetween": 2000,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "sendTo": "={{ $json.emailNormalized }}",
+        "subject": "={{ $json.emailSubject }}",
+        "emailType": "html",
+        "message": "={{ $json.emailHtml }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "CRED_GMAIL",
+          "name": "Gmail ÓRBITA"
+        }
+      }
+    },
+    {
+      "typeVersion": 4.2,
+      "position": [
+        3520,
+        300
+      ],
+      "id": "slack-notify",
+      "name": "Slack notify",
+      "type": "n8n-nodes-base.httpRequest",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetween": 2000,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_INCOMING_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackPayload) }}",
+        "options": {}
+      }
+    },
+    {
+      "typeVersion": 2.2,
+      "position": [
+        3740,
+        300
+      ],
+      "id": "needs-calendar-",
+      "name": "Needs calendar?",
+      "type": "n8n-nodes-base.if",
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cal",
+              "leftValue": "={{ $json.needsCalendar }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "typeVersion": 2,
+      "position": [
+        3960,
+        180
+      ],
+      "id": "next-business-hour",
+      "name": "Next business hour",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "jsCode": "\nconst item = $input.first().json;\nfunction nextSlot(now) {\n  const tz = \"America/Mexico_City\";\n  const fmt = new Intl.DateTimeFormat(\"en-CA\", { timeZone: tz, hour12: false, year: \"numeric\", month: \"2-digit\", day: \"2-digit\", hour: \"2-digit\", minute: \"2-digit\", weekday: \"short\" });\n  let d = new Date(now.getTime() + 60 * 60 * 1000);\n  for (let i = 0; i < 96; i++) {\n    const parts = Object.fromEntries(fmt.formatToParts(d).map(function(p){ return [p.type, p.value]; }));\n    const wd = parts.weekday;\n    const hour = Number(parts.hour);\n    const weekend = wd === \"Sat\" || wd === \"Sun\";\n    if (!weekend && hour >= 9 && hour < 18) return d;\n    d = new Date(d.getTime() + 30 * 60 * 1000);\n  }\n  return d;\n}\nconst start = nextSlot(new Date());\nconst end = new Date(start.getTime() + 30 * 60 * 1000);\nitem.calendarStart = start.toISOString();\nitem.calendarEnd = end.toISOString();\nitem.calendarSummary = \"Llamar lead A · \" + (item.fullName || \"\") + \" · \" + (item.company || \"\");\nreturn [{ json: item }];\n"
+      }
+    },
+    {
+      "typeVersion": 1.3,
+      "position": [
+        4180,
+        180
+      ],
+      "id": "google-calendar",
+      "name": "Google Calendar",
+      "type": "n8n-nodes-base.googleCalendar",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetween": 2000,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "calendar": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.CALENDAR_ID || 'primary' }}"
+        },
+        "start": "={{ $json.calendarStart }}",
+        "end": "={{ $json.calendarEnd }}",
+        "additionalFields": {
+          "summary": "={{ $json.calendarSummary }}",
+          "description": "={{ 'Lead A ' + $json.leadId + ' ' + $json.emailNormalized }}",
+          "timeZone": {
+            "timezone": "America/Mexico_City"
+          }
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "CRED_GCAL",
+          "name": "Google Calendar ÓRBITA"
+        }
+      }
+    },
+    {
+      "typeVersion": 2,
+      "position": [
+        4400,
+        300
+      ],
+      "id": "build-log",
+      "name": "Build log",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "jsCode": "\nconst item = $input.first().json;\nconst mask = function(email) {\n  const p = String(email||\"\").split(\"@\");\n  if (p.length < 2) return \"***\";\n  return p[0].slice(0,1) + \"***@\" + p[1];\n};\nreturn [{ json: {\n  ts: new Date(),\n  level: item.flags && item.flags.spam ? \"warn\" : \"info\",\n  leadId: item.leadId,\n  submissionId: item.submissionId,\n  executionId: $execution && $execution.id ? String($execution.id) : \"\",\n  step: item.logStep || \"lead-intake\",\n  status: item.logStatus || \"ok\",\n  message: item.logMessage || (\"tier \" + item.tier + \" score \" + item.score + \" email \" + mask(item.emailNormalized)),\n} }];\n"
+      }
+    },
+    {
+      "typeVersion": 1.2,
+      "position": [
+        4620,
+        300
+      ],
+      "id": "insert-log",
+      "name": "Insert log",
+      "type": "n8n-nodes-base.mongoDb",
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "operation": "insert",
+        "collection": "logs",
+        "fields": "ts,level,leadId,submissionId,executionId,step,status,message",
+        "options": {}
+      },
+      "credentials": {
+        "mongoDb": {
+          "id": "CRED_MONGO",
+          "name": "MongoDB leadflow"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize lead": {
+      "main": [
+        [
+          {
+            "node": "Find existing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find existing": {
+      "main": [
+        [
+          {
+            "node": "Has duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has duplicate?": {
+      "main": [
+        [
+          {
+            "node": "Mark duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Validate email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark duplicate": {
+      "main": [
+        [
+          {
+            "node": "Prepare outputs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate email": {
+      "main": [
+        [
+          {
+            "node": "Merge email check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge email check": {
+      "main": [
+        [
+          {
+            "node": "Score lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score lead": {
+      "main": [
+        [
+          {
+            "node": "Ask LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask LLM": {
+      "main": [
+        [
+          {
+            "node": "Parse AI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI": {
+      "main": [
+        [
+          {
+            "node": "Score after AI spam",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score after AI spam": {
+      "main": [
+        [
+          {
+            "node": "Insert lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert lead": {
+      "main": [
+        [
+          {
+            "node": "Prepare outputs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare outputs": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond to Webhook": {
+      "main": [
+        [
+          {
+            "node": "Email templates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email templates": {
+      "main": [
+        [
+          {
+            "node": "Skip confirmation?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip confirmation?": {
+      "main": [
+        [
+          {
+            "node": "Slack notify",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gmail confirm",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail confirm": {
+      "main": [
+        [
+          {
+            "node": "Slack notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack notify": {
+      "main": [
+        [
+          {
+            "node": "Needs calendar?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs calendar?": {
+      "main": [
+        [
+          {
+            "node": "Next business hour",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Next business hour": {
+      "main": [
+        [
+          {
+            "node": "Google Calendar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Calendar": {
+      "main": [
+        [
+          {
+            "node": "Build log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build log": {
+      "main": [
+        [
+          {
+            "node": "Insert log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Mexico_City",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

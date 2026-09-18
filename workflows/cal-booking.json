@@ -1,0 +1,131 @@
+{
+  "name": "cal-booking",
+  "id": "wf_cal_booking",
+  "active": false,
+  "isArchived": false,
+  "nodes": [
+    {
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        300
+      ],
+      "id": "cal-webhook",
+      "name": "Cal webhook",
+      "type": "n8n-nodes-base.webhook",
+      "webhookId": "cal-booking",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cal-booking",
+        "authentication": "headerAuth",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "CRED_CAL_HEADER",
+          "name": "Cal.com Header Auth"
+        }
+      }
+    },
+    {
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "id": "map-booking",
+      "name": "Map booking",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "jsCode": "const b = $input.first().json.body || $input.first().json;\nconst trigger = b.triggerEvent || b.trigger || \"\";\nconst payload = b.payload || b;\nconst leadId = (payload.metadata && (payload.metadata.leadId || payload.metadata.leadID)) || \"\";\nconst status = String(trigger).includes(\"CANCEL\") ? \"cancelled\" : \"booked\";\nreturn [{ json: {\n  leadId,\n  meeting: {\n    status,\n    bookingId: payload.uid || payload.id || \"\",\n    startsAt: payload.startTime || payload.start || \"\",\n    title: payload.title || \"\",\n  },\n  log: {\n    ts: new Date(),\n    level: \"info\",\n    leadId,\n    submissionId: \"\",\n    executionId: String($execution && $execution.id || \"\"),\n    step: \"cal-booking\",\n    status,\n    message: \"Cal.com \" + trigger + \" booking \" + (payload.uid || \"\"),\n  }\n} }];"
+      }
+    },
+    {
+      "typeVersion": 1.2,
+      "position": [
+        440,
+        180
+      ],
+      "id": "update-meeting",
+      "name": "Update meeting",
+      "type": "n8n-nodes-base.mongoDb",
+      "parameters": {
+        "operation": "update",
+        "collection": "leads",
+        "updateKey": "leadId",
+        "fields": "meeting",
+        "options": {
+          "upsert": false
+        }
+      },
+      "credentials": {
+        "mongoDb": {
+          "id": "CRED_MONGO",
+          "name": "MongoDB leadflow"
+        }
+      }
+    },
+    {
+      "typeVersion": 1.2,
+      "position": [
+        440,
+        420
+      ],
+      "id": "insert-cal-log",
+      "name": "Insert cal log",
+      "type": "n8n-nodes-base.mongoDb",
+      "parameters": {
+        "operation": "insert",
+        "collection": "logs",
+        "fields": "ts,level,leadId,submissionId,executionId,step,status,message",
+        "options": {}
+      },
+      "credentials": {
+        "mongoDb": {
+          "id": "CRED_MONGO",
+          "name": "MongoDB leadflow"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Cal webhook": {
+      "main": [
+        [
+          {
+            "node": "Map booking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map booking": {
+      "main": [
+        [
+          {
+            "node": "Update meeting",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Insert cal log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Mexico_City",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

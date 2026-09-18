@@ -1,0 +1,113 @@
+{
+  "name": "nurturing-cron",
+  "id": "wf_nurturing_cron",
+  "active": false,
+  "isArchived": false,
+  "nodes": [
+    {
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "id": "every-morning",
+      "name": "Every morning",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        300
+      ],
+      "id": "find-due-c",
+      "name": "Find due C",
+      "type": "n8n-nodes-base.mongoDb",
+      "parameters": {
+        "operation": "find",
+        "collection": "leads",
+        "options": {},
+        "query": "={ \"tier\": \"C\", \"status\": { \"$ne\": \"spam\" }, \"nurturing.nextStepAt\": { \"$lte\": \"{{ $now }}\" } }"
+      },
+      "credentials": {
+        "mongoDb": {
+          "id": "CRED_MONGO",
+          "name": "MongoDB leadflow"
+        }
+      }
+    },
+    {
+      "typeVersion": 2.1,
+      "position": [
+        440,
+        300
+      ],
+      "id": "gmail-nurture",
+      "name": "Gmail nurture",
+      "type": "n8n-nodes-base.gmail",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetween": 2000,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "sendTo": "={{ $json.emailNormalized }}",
+        "subject": "Seguimos en trayectoria, {{ $json.firstName || 'hola' }}",
+        "emailType": "html",
+        "message": "=<p>Hola {{ $json.fullName }}, te escribimos desde ÓRBITA (demo) con un siguiente paso breve.</p>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "CRED_GMAIL",
+          "name": "Gmail ÓRBITA"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every morning": {
+      "main": [
+        [
+          {
+            "node": "Find due C",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find due C": {
+      "main": [
+        [
+          {
+            "node": "Gmail nurture",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Mexico_City",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

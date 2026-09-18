@@ -1,0 +1,116 @@
+{
+  "name": "error-handler",
+  "id": "wf_error_handler",
+  "active": false,
+  "isArchived": false,
+  "nodes": [
+    {
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ],
+      "id": "error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "parameters": {}
+    },
+    {
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "id": "format-error",
+      "name": "Format error",
+      "type": "n8n-nodes-base.code",
+      "parameters": {
+        "jsCode": "const e = $input.first().json;\nconst executionId = e.execution && e.execution.id ? e.execution.id : (e.id || \"\");\nconst msg = (e.execution && e.execution.error && e.execution.error.message) || e.message || \"Error en workflow\";\nreturn [{ json: {\n  ts: new Date(),\n  level: \"error\",\n  leadId: \"\",\n  submissionId: \"\",\n  executionId: String(executionId),\n  step: \"error-handler\",\n  status: \"error\",\n  message: String(msg).slice(0, 500),\n  slackPayload: { text: \"n8n error \" + executionId + \" — \" + String(msg).slice(0, 300) }\n} }];"
+      }
+    },
+    {
+      "typeVersion": 1.2,
+      "position": [
+        440,
+        180
+      ],
+      "id": "log-error",
+      "name": "Log error",
+      "type": "n8n-nodes-base.mongoDb",
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "operation": "insert",
+        "collection": "logs",
+        "fields": "ts,level,leadId,submissionId,executionId,step,status,message",
+        "options": {}
+      },
+      "credentials": {
+        "mongoDb": {
+          "id": "CRED_MONGO",
+          "name": "MongoDB leadflow"
+        }
+      }
+    },
+    {
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        420
+      ],
+      "id": "slack-error",
+      "name": "Slack error",
+      "type": "n8n-nodes-base.httpRequest",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetween": 2000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_INCOMING_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.slackPayload.text }) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Format error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format error": {
+      "main": [
+        [
+          {
+            "node": "Log error",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Slack error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Mexico_City",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

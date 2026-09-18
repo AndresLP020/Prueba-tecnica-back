@@ -1,0 +1,121 @@
+{
+  "name": "outbox-retry",
+  "id": "wf_outbox_retry",
+  "active": false,
+  "isArchived": false,
+  "nodes": [
+    {
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "id": "every-5-min",
+      "name": "Every 5 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      }
+    },
+    {
+      "typeVersion": 1.2,
+      "position": [
+        220,
+        300
+      ],
+      "id": "find-pending",
+      "name": "Find pending",
+      "type": "n8n-nodes-base.mongoDb",
+      "parameters": {
+        "operation": "find",
+        "collection": "submissions",
+        "options": {
+          "limit": 20
+        },
+        "query": "{ \"status\": \"pending\", \"attempts\": { \"$lt\": 5 } }"
+      },
+      "credentials": {
+        "mongoDb": {
+          "id": "CRED_MONGO",
+          "name": "MongoDB leadflow"
+        }
+      }
+    },
+    {
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        300
+      ],
+      "id": "replay-webhook",
+      "name": "Replay webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetween": 2000,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_WEBHOOK_INTERNAL_URL || 'http://localhost:5678/webhook/lead-intake' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Webhook-Secret",
+              "value": "={{ $env.N8N_WEBHOOK_SECRET }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload || $json) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Every 5 min": {
+      "main": [
+        [
+          {
+            "node": "Find pending",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find pending": {
+      "main": [
+        [
+          {
+            "node": "Replay webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Mexico_City",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
